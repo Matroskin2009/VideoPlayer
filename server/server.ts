@@ -10,23 +10,25 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { getCookie, setCookie, deleteCookie } from 'hono/cookie';
 import { sendVerificationEmail } from './lib/email.js';
-import crypto from 'crypto'; 
-import { eq } from 'drizzle-orm'; 
+import crypto from 'crypto';
+import { eq, sql, and } from 'drizzle-orm';
+import { likes, subscriptions, videos } from './db/schema';
 
 const app = new Hono();
 
-app.use('*', cors()); 
+app.use('*', cors({
+  origin: 'http://localhost:3000',
+  credentials: true,
+}));
 
-app.get('/api/hello', (c) => {
-  return c.json({ message: 'Hello from backend via Hono!' });
-});
-
+//подключение клиента
 const googleClient = new OAuth2Client({
   clientId: process.env.GOOGLE_CLIENT_ID,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET,
   redirectUri: 'http://localhost:3001/auth/google/callback',
 });
 
+//переброс на гугл регистрацию с просьбой получить scope
 app.get('/auth/google', (c) => {
   const url = googleClient.generateAuthUrl({
     scope: ['email', 'profile'],
@@ -44,26 +46,54 @@ app.get('/auth/google/callback', async (c) => {
 
   const { sub, email, name, picture } = ticket.getPayload()!;
 
-  const existingUser = await db.query.users.findFirst({
+  let user = await db.query.users.findFirst({
     where: (users, { eq }) => eq(users.google_id, sub),
   });
 
-  if (!existingUser) {
-    await db.insert(users).values({
-      google_id: sub,
-      email: email!,
-      username: name || email?.split('@')[0] || 'user',
-      avatar_url: picture || '/default-avatar.jpg', 
+  if (!user) {
+    // Если пользователя с таким google_id нет, ищем по email
+    user = await db.query.users.findFirst({
+      where: (users, { eq }) => eq(users.email, email!),
     });
+
+    if (user) {
+      // Если пользователь с таким email уже есть, просто обновляем google_id
+      await db.update(users).set({
+        google_id: sub,
+        avatar_url: picture || '/default-avatar.jpg',
+      }).where(eq(users.id, user.id));
+    } else {
+      // Если вообще нет — создаём нового
+      await db.insert(users).values({
+        google_id: sub,
+        email: email!,
+        username: name || email?.split('@')[0] || 'user',
+        password_hash: '',
+        avatar_url: picture || '/default-avatar.jpg',
+      });
+      user = await db.query.users.findFirst({
+        where: (users, { eq }) => eq(users.google_id, sub),
+      });
+    }
   }
 
-  return c.redirect(`http://localhost:3000?token=${tokens.id_token}`);
+  const sessionId = crypto.randomUUID();
+  sessions[sessionId] = { userId: user.id };
+  setCookie(c, 'session_id', sessionId, {
+    httpOnly: true,
+    secure: false,
+    sameSite: 'Lax',
+    path: '/',
+    maxAge: 60 * 60 * 24 * 7,
+  });
+
+  return c.redirect('http://localhost:3000');
 });
 
 const sessions: Record<string, { userId: number }> = {};
 
 const registerSchema = z.object({
-  username: z.string().min(3, "Имя пользователя должно быть не короче 3 символов"),
+  username: z.string().min(1, "Имя пользователя не может быть пустое"),
   email: z.string().email("Некорректный email"),
   password: z.string().min(6, "Пароль должен быть не короче 6 символов"),
 });
@@ -86,7 +116,7 @@ app.post('/api/auth/register', zValidator('json', registerSchema), async (c) => 
   const password_hash = await bcrypt.hash(password, saltRounds);
 
   const verificationToken = crypto.randomBytes(32).toString('hex');
-  const verificationTokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); 
+  const verificationTokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
 
   const unverifiedUser = await db.query.users.findFirst({
       where: (users, { eq }) => eq(users.email, email)
@@ -145,10 +175,10 @@ app.post('/api/auth/login', zValidator('json', loginSchema), async (c) => {
 
   setCookie(c, 'session_id', sessionId, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
+    secure: false,
     sameSite: 'Lax',
     path: '/',
-    maxAge: 60 * 60 * 24 * 7, 
+    maxAge: 60 * 60 * 24 * 7,
   });
 
   return c.json({ message: 'Вход выполнен успешно' });
@@ -176,15 +206,47 @@ app.get('/api/auth/me', async (c) => {
     return c.json({ user: null }, 401);
   }
 
-  return c.json({ user });
+  const subscribersCount = await db.select({
+    count: sql<number>`count(*)`
+  }).from(subscriptions).where(eq(subscriptions.target_id, user.id));
+
+  const userVideos = await db.select({
+    id: videos.id
+  }).from(videos).where(eq(videos.user_id, user.id));
+
+  const videoIds = userVideos.map(v => v.id);
+
+  let likesCount = [{ count: 0 }];
+  if (videoIds.length > 0) {
+    likesCount = await db.select({
+      count: sql<number>`count(*)`
+    }).from(likes).where(and(eq(likes.user_id, user.id), sql`video_id IN ${videoIds}`));
+  }
+
+  return c.json({
+    user: {
+      ...user,
+      subscribers: subscribersCount[0].count,
+      likes: likesCount[0].count,
+    }
+  });
 });
 
 app.post('/api/auth/logout', async (c) => {
   const sessionId = getCookie(c, 'session_id');
-  if (sessionId && sessions[sessionId]) {
+
+  if (sessionId) {
     delete sessions[sessionId];
   }
-  deleteCookie(c, 'session_id', { path: '/' });
+
+  deleteCookie(c, 'session_id', {
+    path: '/',
+    domain: 'localhost',
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'Lax',
+    httpOnly: true
+  });
+
   return c.json({ message: 'Выход выполнен успешно' });
 });
 
@@ -214,7 +276,7 @@ app.get('/api/auth/verify-email', async (c) => {
 
   await db.update(users).set({
     email_verified: true,
-    email_verification_token: null, 
+    email_verification_token: null,
     email_verification_expires: null,
   }).where(eq(users.id, user.id));
 
